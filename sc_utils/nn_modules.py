@@ -2609,120 +2609,103 @@ def get_predictions_multilabel_clf(model, data_loader):
 
 
 
+class BnLinear(nn.Module): 
+
+    def __init__(self, input_dim, output_dim): 
+        super(BnLinear, self).__init__()
+
+        self.linear = nn.Linear(input_dim, output_dim)
+        self.bn = nn.BatchNorm1d(output_dim)
+        #self.relu = nn.ReLU()
+        #self.leaky_relu = nn.LeakyReLU()
+
+    def forward(self, input): 
+        x = self.linear(input)
+        x = self.bn(x)
+        #x = self.relu(x)
+        
+        return x
+
+
+class supervised_model(nn.Module): 
+
+    def __init__(self, dims, model = 'regression', dropout = True):
+        """
+        Multi-layer perceptron for classification and regression.
+        It is built with Linear layers that use Batch Normalization
+        and ReLU as activation functions. The model type is defined 
+        using the `model` argument. 
+
+        dims (list): 
+            Dimensions of the MLP. First element is the input dimension, 
+            final element is the output dimension. 
+
+        model (str, default = 'regression'): 
+            Type of supervised model. Options are 
+            'regression': For classic MLP regression.
+            'multilabel': For multilabel classification.
+            'binary': For binary classification.
+
+            Notes: Multilabel uses F.log_softmax as activation 
+            layer. Use nn.NLLLoss as loss function. 
+
+        """
+
+        super(supervised_model, self).__init__()
+
+        self.output_dim = dims[-1]
+
+        # Start range from 1 so that dims[i-1] = dims[0]
+        linear_layers = [BnLinear(dims[i-1], dims[i]) for i in range(1, len(dims[:-1]))]
+
+        self.fc_layers = nn.ModuleList(linear_layers)
+
+        self.final_layer = BnLinear(dims[-2], self.output_dim)
+
+        self.model = model
+        self.dropout=dropout
+        self.relu = nn.Tanh()#nn.ReLU()
+
+    def project(self, x): 
+        "Projects data up to second-to-last layer for visualization."
+
+        for fc_layer in self.fc_layers[:-1]:
+            x = fc_layer(x)
+            x = self.relu(x)
+
+        x = self.fc_layers[-1](x)
+
+        return x
+
+    def forward(self, x):
+
+        for fc_layer in self.fc_layers:
+            x = fc_layer(x)
+            x = self.relu(x)
+
+        # Pass through final linear layer 
+        if self.model == 'regression':  
+
+            if self.dropout:
+                x = F.dropout(x)
+            x = self.final_layer(x)
+            return x
+
+        if self.model == 'multilabel':
+            if self.dropout:
+                x = F.dropout(x)
+            x = self.final_layer(x)
+            x = F.log_softmax(x, dim = 1)
+
+            return x
+
+        if self.model == 'binary':
+            if self.dropout:
+                x = F.dropout(x)
+            x = self.final_layer(x)
+            x = F.sigmoid(x)
+
+            return x
 
 
 
-
-
-
-
-# class GraphConvolution(Module): 
-    
-#     """
-#     Simple Graph Conv layer. 
-#     """
-
-#     def __init__(self, input_dim, output_dim):
-#         super(GraphConvolution, self).__init__()
-#         self.weight = Parameter(torch.FloatTensor(input_dim, output_dim))
-#         self.bias = Parameter(torch.FloatTensor(output_dim))
-#         self.reset_parameters()
-
-#     def reset_parameters(self):
-#         std_dev = 1./np.sqrt(self.weight.size(1))
-
-#         self.weight.data.uniform_(-std_dev, std_dev)
-
-#         self.bias.data.uniform_(-std_dev, std_dev)
-
-#     def forward(self, input, adj): 
-
-#         x = torch.mm(input, self.weight)
-#         output = torch.spmm(adj, x)
-
-#         return output + self.bias
-
-# class BnGraphConvLayer(nn.Module): 
-
-#     def __init__(self, input_dim, output_dim): 
-#         super(BnGraphConvLayer, self).__init__()
-
-#         self.graph_conv = GraphConvolution(input_dim, output_dim)
-#         self.bn = nn.BatchNorm1d(output_dim)
-
-#     def forward(self, input, adj): 
-#         x = self.graph_conv(input_dim, adj)
-#         x = self.bn(x)
-
-#         return x 
-
-# class GCN(nn.Module):
-
-#     def __init__(self, input_dim, hidden_dim, n_classes):
-
-#         super(GCN, self).__init__()
-#         self.gc1 = GraphConvolution(input_dim, hidden_dim)
-#         self.gc2 = GraphConvolution(hidden_dim, n_classes)
-
-#     def forward(self, x, adj): 
-#         x = F.relu(self.gc1(x, adj))
-#         x = self.gc2(x, adj)
-#         out = F.log_softmax(x, dim = 1)
-#         return out
-
-
-# class DeepGCN(nn.Module): 
-
-#     """
-#     Deep Graph Convolutional Neural Network using batch normalization. 
-#     """
-
-#     def __init__(self, dims): 
-
-#         """
-#         Params 
-#         ------
-#         dims (list)
-#             Designed to be supplied in the following format: 
-#             [input_dim, [hidden_dims], output_dim]
-
-#         """
-
-#         super(DeepGCN, self).__init__()
-
-
-#         [input_dim, h_dim, output_dim] = dims
-
-#         neurons = [input_dim, *h_dim]
-
-#         conv_layers = [BnGraphConvLayer(neurons[i-1], neurons[i]) for i in range(1, len(neurons))]
-
-#         self.conv_layers = nn.ModuleList(conv_layers)
-#         self.output_layer = BnGraphConvLayer(neurons[-1], output_dim)
-
-
-#     def forward(self, x, adj): 
-
-#         for GCN_layer in self.conv_layers: 
-#             x = GCN_layer(x, adj)
-#             x = F.relu(x)
-
-#         x = self.output_layer(x, adj)
-#         out = F.log_softmax(x, dim=1)
-
-#         return out
-
-
-
-
-
-
-
-# DataLoader 
-
-# Transform 
-
-#transforms.CenterCrop()
-#transforms.ToTensor()
-
-# VAE 
