@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.optim as optim 
 import torch.distributions as td
 
-import torchvision 
+import torchvision
 import torchvision.transforms as transforms 
 import torch.nn.functional as F
 from torch.autograd import Variable
@@ -1446,12 +1446,108 @@ class MLP(nn.Module):
 
         
 
-# class accordeon_MLP(nn.Module):
-#     "Contraction-expansion MLP for visualization."
+class BnLinear(nn.Module): 
 
-#     def __init__(self): 
+    def __init__(self, input_dim, output_dim): 
+        super(BnLinear, self).__init__()
+
+        self.linear = nn.Linear(input_dim, output_dim)
+        self.bn = nn.BatchNorm1d(output_dim)
+        #self.relu = nn.ReLU()
+        #self.leaky_relu = nn.LeakyReLU()
+
+    def forward(self, input): 
+        x = self.linear(input)
+        x = self.bn(x)
+        #x = self.relu(x)
         
-        
+        return x
+
+#model(x)
+
+class supervised_model(nn.Module): 
+    """General supervised model. """
+
+    def __init__(self, dims, model = 'regression', dropout = True):
+        """
+        Multi-layer perceptron for classification and regression.
+        It is built with Linear layers that use Batch Normalization
+        and ReLU as activation functions. The model type is defined 
+        using the `model` argument. 
+
+        dims (list): 
+            Dimensions of the MLP. First element is the input dimension, 
+            final element is the output dimension. 
+
+        model (str, default = 'regression'): 
+            Type of supervised model. Options are 
+            'regression': For classic MLP regression.
+            'multilabel': For multilabel classification.
+            'binary': For binary classification.
+
+            Notes: Multilabel uses F.log_softmax as activation 
+            layer. Use nn.NLLLoss as loss function. 
+
+        """
+
+        super(supervised_model, self).__init__()
+
+        self.output_dim = dims[-1]
+
+        # Start range from 1 so that dims[i-1] = dims[0]
+        linear_layers = [BnLinear(dims[i-1], dims[i]) for i in range(1, len(dims[:-1]))]
+
+        self.fc_layers = nn.ModuleList(linear_layers)
+
+        self.final_layer = BnLinear(dims[-2], self.output_dim)
+
+        self.model = model
+        self.dropout=dropout
+        self.relu = nn.Tanh()#nn.ReLU()
+
+    def project(self, x): 
+        "Projects data up to second-to-last layer for visualization."
+
+        for fc_layer in self.fc_layers[:-1]:
+            x = fc_layer(x)
+            x = self.relu(x)
+
+        x = self.fc_layers[-1](x)
+
+        return x
+
+    def forward(self, x):
+
+        for fc_layer in self.fc_layers:
+            x = fc_layer(x)
+            x = self.relu(x)
+
+        # Pass through final linear layer 
+        if self.model == 'regression':  
+
+            if self.dropout:
+                x = F.dropout(x)
+            x = self.final_layer(x)
+            return x
+
+        if self.model == 'multiclass':
+            if self.dropout:
+                x = F.dropout(x)
+            x = self.final_layer(x)
+            x = F.log_softmax(x, dim = 1)
+
+            return x
+
+        if self.model == 'binary':
+            if self.dropout:
+                x = F.dropout(x)
+            x = self.final_layer(x)
+            x = F.sigmoid(x)
+
+            return x
+
+
+
 
 class mlp_data_df(Dataset): 
     
@@ -1515,7 +1611,7 @@ def project_data_into_latent_cell(data_loader, n_feats, model, latent_dim):
         Number of dimensions of original dataset.
     
     model (nn.Module)
-        Neural model to be used for inference. 
+        Neural network model to be used for inference. 
         
     Returns (yields)
     -------
@@ -1543,9 +1639,64 @@ def project_data_into_latent_cell(data_loader, n_feats, model, latent_dim):
             yield encoded_sample
 
 
+def supervised_trainer(n_epochs, train_loader, val_loader, model,
+                     criterion, optimizer, n_classes = 1): 
+    
+    batch_size = train_loader.batch_size
+    print_every = np.floor(train_loader.dataset.__len__() / batch_size / 10) # minibatches
 
+    loss_vector = [] # to store training loss 
+    val_loss_vector = np.empty(shape = n_epochs)
 
+    for epoch in np.arange(n_epochs): 
+        
+        running_loss = 0
 
+        # TRAINING LOOP
+        for ix, (data, y_true) in enumerate(tqdm.tqdm(train_loader)): 
+            
+            input_ = data.view(batch_size, -1).float()
+        
+            train_loss = train_supervised(
+                model,
+                input_, 
+                y_true, 
+                criterion, 
+                optimizer,
+                n_classes = n_classes
+                )
+            
+            running_loss += train_loss.item()
+            
+             # Print loss 
+            if ix % print_every == print_every -1 : 
+                
+                # Print average loss 
+                print('[%d, %5d] loss: %.3f' %
+                      (epoch + 1, ix+1, running_loss / print_every))
+                
+                loss_vector.append(running_loss / print_every)
+                
+                # Reinitialize loss
+                running_loss = 0.0
+        
+        # VALIDATION LOOP
+        with torch.no_grad():
+            validation_loss = []
+            
+            for i, (data, y_true) in enumerate(tqdm.tqdm(val_loader)):
+                input_ = data.view(batch_size, -1).float()
+                val_loss = validation_supervised(model, input_, y_true, criterion)
+                validation_loss.append(val_loss)
+                
+            mean_val_loss = np.mean(validation_loss).round(2)
+            val_loss_vector[epoch] = mean_val_loss
+            
+            print(f'Val. loss : {mean_val_loss}')
+        
+    print('Finished training')
+
+    return loss_vector, validation_loss
 
 class image_data_flatten_popAE(Dataset): 
     
@@ -1665,37 +1816,90 @@ class unsupervised_dataset(Dataset):
 
 
 class scanpy_dataset(Dataset): 
+    """
+    Base class for a single cell dataset in .h5ad, i.e. AnnData format
+    This object enables building models in pytorch.
+    It currently supports unsupervised (matrix factorization / autoencoder)
+    and general supervised (classification/regression) models.
 
-    def __init__(self, data= None, transform = False, conv = False):
+    Params
+    ------
+    data (ad.AnnData)
+        AnnDataset containing the count matrix in the data.X object. 
+
+    transform (torchvision.transforms, default= False)
+        A torchvision.transforms-type transformation, e.g. ToTensor()
+
+    supervised (bool, default = False)
+        Indicator variable for supervised models. 
+
+    target_col (string/array-like, default = None)
+        If running a supervised model, target_col should be a column 
+        or set of columns in the adata.obs dataframe. 
+        When running a binary or multiclass classifier, the labels 
+        should be in a single column in a int64 format. 
+        I repeat, even if running a multiclass classifier, do not specify
+        the columns as one-hot encoded. The one-hot encoded vector 
+        will be specified in the classifier model. The reason is that, 
+        nn.CrossEntropyLoss() and the more numerically stable nn.NLLLoss()
+        takes the true labels as input in integer form (e.g. 1,2,3),
+        not in one-hot encoded version (e.g. [1, 0, 0], [0, 1, 0], [0, 0, 1]).
+
+        When running a multilabel classifier, specify the columns as a list.
+        In this case, we will use the nn.BCELoss() using the one-hot encoded 
+        labels. This is more akin to a multi-output classification.
+
+    multilabel (bool, default = False)
+        Indicator variable to specify a multilabel classifier dataset. 
+
+    Returns
+    -------
+    data_point(torch.tensor)
+        A single datapoint (row) of the dataset in torch.tensor format. 
+
+    target(torch.tensor)
+        If running supervised model, the "y" or target label to be predicted.
+    """
+
+    def __init__(self, data= None, transform = False, supervised = False,
+                target_col = None, multilabel = False):
+
+        self.data = data # This is the h5ad / AnnDataset
+
+        self.supervised = supervised 
+        self.target_col = target_col
         self.transform = transform
 
-        # if path_to_data is not None: 
-
-        #     self.data = np.loadtxt(path_to_data, delimiter = '\t')
-        
-        # elif data is not None: 
-        self.data = data
-
-        # else: 
-        #     print('Need to provide either a dataset in np.array fmt or a path to the file. ')
-        
-        #self.conv = conv
-        #self.res = res
         from scipy import sparse
-
         # Indicator of data being in sparse matrix format. 
-        self.sparse = isinstance(data.X, (sparse.csr_matrix, sparse.coo_matrix))
+        self.sparse = sparse.isspmatrix(data.X)
+
+        self.multilabel = multilabel
+
+        if self.multilabel:
+            from sklearn.preprocessing import OneHotEncoder
+            # Initialize one hot encoder
+            enc = OneHotEncoder(sparse = False)
+            self.one_hot_encoder = enc
+
+            # Extract target data 
+            y_data = self.data.obs[self.target_col].values.astype(str).reshape(-1,1)
+
+            # Build one hot encoder
+            self.one_hot_encoder.fit(y_data)
+
+            # Get one-hot matrix and save as attribute
+            self.multilabel_codes = self.one_hot_encoder.transform(y_data)
         
     def __len__(self):
-        return self.data.shape[0]
+        return self.data.n_obs
     
     def __getitem__(self, ix): 
         
-        if type(ix) == torch.Tensor: 
+        if type(ix) == torch.Tensor:
             ix = ix.tolist()
             
-        # Get a single row of dataset
-        # and convert matrix 
+        # Get a single row of dataset and convert to numpy array if needed
         if self.sparse: 
             data_point = self.data[ix, :].X.A.astype(np.float64)
             
@@ -1704,11 +1908,45 @@ class scanpy_dataset(Dataset):
                  
         # if self.conv:
         #     image = image.reshape(1, self.res, self.res)
-        
+
         if self.transform is not False: 
             data_point = self.transform(data_point)
         
+        # Get labels for supervised classification model
+        if self.supervised and self.multilabel:
+            target = self.multilabel_codes[ix, :]
+            return data_point, target 
+
+        elif self.supervised:
+            target  = self.data.obs.iloc[ix][self.target_col]
+            return data_point, target
+
+        else:
+            pass
+
         return data_point
+
+    def codes_to_cat_labels(self, one_hot_labels): 
+        """
+        Returns categorical classes from labels in one-hot format.
+
+        Params
+        ------
+        one_hot_labels (array-like)
+            Labels of (a potentially new or predicted) dataset
+            in one-hot-encoded format. 
+        
+        Returns 
+        -------
+        cat_labels(array-like, or list of array-like)
+            Categorical labels of the one-hot encoded input. 
+
+        """
+
+        cat_labels = self.one_hot_encoder.inverse_transform(one_hot_labels)
+
+        return cat_labels
+
 
 class unsupervised_image_data(Dataset): 
     """
@@ -2474,7 +2712,7 @@ class supervised_dataset_clf(Dataset):
         of categorical variables in string format. 
     
     multilabel (bool, default False)
-        Set to True if the supervised learning problem is 
+        Set to True if it is a multilabel classification problem. 
 
     transform ()
     """
@@ -2482,7 +2720,7 @@ class supervised_dataset_clf(Dataset):
     def __init__(self, path_to_datasets = None, data_x = None, data_y= None,
                  multilabel = False, conv = False, transform_ = False): 
 
-        from sklearn.preprocessing import OneHotEncoder
+        
         self.transform_ = transform_
         
         if path_to_datasets is not None: 
@@ -2496,11 +2734,10 @@ class supervised_dataset_clf(Dataset):
         else: 
             print('Need to provide either a dataset in np.array fmt or a path to the file. ')
         
-        #self.conv = conv
-        #self.res = res
-
+    
         self.multilabel = multilabel
 
+        from sklearn.preprocessing import OneHotEncoder
         # One hot encode and get codes 
         enc = OneHotEncoder(sparse = False)
         self.one_hot_encoder = enc
@@ -2515,8 +2752,9 @@ class supervised_dataset_clf(Dataset):
 
         # Save one-hot encoder inside Dataset object 
         
-
         self.data_y = codes
+        #self.conv = conv
+        #self.res = res
 
     def codes_to_cat_labels(self, one_hot_labels): 
         """
@@ -2578,134 +2816,232 @@ class supervised_dataset_clf(Dataset):
 
 
 
-def get_predictions_multilabel_clf(model, data_loader): 
+# def get_predictions_supervised(model, data_loader, n_feats): 
 
+#     """
+#     Returns an generator over predicted labels for a supervised model.
+
+#     Params 
+#     ------
+#     model (torch.nn.Module)
+#         Trained supevised model.
+
+#     data_loader(torch.dataloader)
+        
+
+#     Returns 
+#     -------
+#     predictions (generator)
+#         Generator over single instance predictions. 
+
+#     """
+
+#     #with torch.no_grad():
+#     for x, y in tqdm.tqdm(data_loader):
+
+#         x = x.view(-1, n_feats)
+
+#         # Make predictions per single data point.
+#         for data_x in x:
+
+#             outputs = model(data_x.float())
+
+#             values, predictions = torch.max(outputs.data, 1)
+
+#             yield predictions
+
+
+def supervised_model_predict(model, data_loader, criterion, n_points = None, n_feats= None,
+                             n_outputs =1, score = True):
     """
-    Returns an generator over predicted labels from 
-    a multilabel classifier. 
+    Analog to model.predict() from sklearn. Returns a prediction vector given a dataloder.
+    It is designed for working with basic supervised models like binary or multilabel classification,
+    and regression.
 
-
-    Params 
+    Params
     ------
-    model (torch.nn.Module)
-        Classifier model.
 
-    dataloader(torch.dataloader)
+    model (torch.nn.model)
+        Trained supervised model 
+
+    data_loader
+
+    n_points (int)
+        Number of instances (rows) in the dataset. If not provided, the function will 
+        try to extract it from the dataloader. 
+
+    n_feats (int)
+        Input dimensions for the model / number of columns in the dataset. If not provided,
+        the function will try to extract it from the dataloader. 
+
+    n_outputs (int, default = 1)
+        Number of outputs of the model. Defaults to 1 dim output, for regression or 
+        binary classification.
+
+    Returns
+    -------
+    y_pred (np.array)
+        Array with raw predictions from a forward pass from the model. 
 
     """
+    if n_points == None and n_feats == None: 
+        try:
+            n_points, n_feats = data_loader.dataset.data.shape
+        except: 
+            print('Need to supply number of datapoints and features in input data.')
+
+    batch_size = data_loader.batch_size
+    # Initialize predictions array 
+    y_pred = torch.zeros(n_points, n_outputs)
+
+    cum_sum = 0
 
     with torch.no_grad():
-        for x, y in tqdm.tqdm(data_loader):
 
-            # Make predictions per single data point.
-            for data_x in x: 
+        for ix, (x, y) in tqdm.tqdm(enumerate(data_loader)):
 
-                outputs = model(data_x.float())
+            # Reshape input for feeding to model 
+            x = x.view(-1, n_feats)
 
-                values, predictions = torch.max(outputs.data, 1)
+            outputs = model(x.float())
 
-                yield predictions
+            y_pred[ix * batch_size : ix * batch_size + batch_size, :] = outputs
+
+            if score: 
+                mean_loss = np.round(
+                    criterion(outputs, y.view(-1, n_outputs).float()).mean().detach().numpy(), 2
+                )
 
 
-
-
-class BnLinear(nn.Module): 
-
-    def __init__(self, input_dim, output_dim): 
-        super(BnLinear, self).__init__()
-
-        self.linear = nn.Linear(input_dim, output_dim)
-        self.bn = nn.BatchNorm1d(output_dim)
-        #self.relu = nn.ReLU()
-        #self.leaky_relu = nn.LeakyReLU()
-
-    def forward(self, input): 
-        x = self.linear(input)
-        x = self.bn(x)
-        #x = self.relu(x)
+                cum_sum+= mean_loss
+                moving_average = cum_sum / (ix + 1)
         
-        return x
+        if score: 
+            print("Mean validation loss: ", moving_average)
+
+    return y_pred.detach().numpy()
 
 
-class supervised_model(nn.Module): 
+def train_supervised(model, input_tensor, y_true, loss_fn, optimizer, n_classes = 1):
+    "Helper function to make forward and backward pass with minibatch."
+    
+    # Zero out grads 
+    model.zero_grad()
+    y_pred = model(input_tensor)
+    
+    # Backprop error
+    loss = loss_fn(y_pred, y_true.view(-1, n_classes).float())
+    loss.backward()
+    # Update weights 
+    optimizer.step()
+    
+    return loss
 
-    def __init__(self, dims, model = 'regression', dropout = True):
-        """
-        Multi-layer perceptron for classification and regression.
-        It is built with Linear layers that use Batch Normalization
-        and ReLU as activation functions. The model type is defined 
-        using the `model` argument. 
+def validation_supervised(model, input_tensor, y_true, loss_fn, n_classes= 1): 
+    "Returns average loss for an input batch of data with a supervised model."
+    y_pred = model(input_tensor.float())
+    loss = loss_fn(y_pred, y_true.view(-1, n_classes).float())
+    
+    return loss.mean()
 
-        dims (list): 
-            Dimensions of the MLP. First element is the input dimension, 
-            final element is the output dimension. 
 
-        model (str, default = 'regression'): 
-            Type of supervised model. Options are 
-            'regression': For classic MLP regression.
-            'multilabel': For multilabel classification.
-            'binary': For binary classification.
 
-            Notes: Multilabel uses F.log_softmax as activation 
-            layer. Use nn.NLLLoss as loss function. 
 
-        """
+# class GraphConvolution(Module): 
+    
+#     """
+#     Simple Graph Conv layer. 
+#     """
 
-        super(supervised_model, self).__init__()
+#     def __init__(self, input_dim, output_dim):
+#         super(GraphConvolution, self).__init__()
+#         self.weight = Parameter(torch.FloatTensor(input_dim, output_dim))
+#         self.bias = Parameter(torch.FloatTensor(output_dim))
+#         self.reset_parameters()
 
-        self.output_dim = dims[-1]
+#     def reset_parameters(self):
+#         std_dev = 1./np.sqrt(self.weight.size(1))
 
-        # Start range from 1 so that dims[i-1] = dims[0]
-        linear_layers = [BnLinear(dims[i-1], dims[i]) for i in range(1, len(dims[:-1]))]
+#         self.weight.data.uniform_(-std_dev, std_dev)
 
-        self.fc_layers = nn.ModuleList(linear_layers)
+#         self.bias.data.uniform_(-std_dev, std_dev)
 
-        self.final_layer = BnLinear(dims[-2], self.output_dim)
+#     def forward(self, input, adj): 
 
-        self.model = model
-        self.dropout=dropout
-        self.relu = nn.Tanh()#nn.ReLU()
+#         x = torch.mm(input, self.weight)
+#         output = torch.spmm(adj, x)
 
-    def project(self, x): 
-        "Projects data up to second-to-last layer for visualization."
+#         return output + self.bias
 
-        for fc_layer in self.fc_layers[:-1]:
-            x = fc_layer(x)
-            x = self.relu(x)
+# class BnGraphConvLayer(nn.Module): 
 
-        x = self.fc_layers[-1](x)
+#     def __init__(self, input_dim, output_dim): 
+#         super(BnGraphConvLayer, self).__init__()
 
-        return x
+#         self.graph_conv = GraphConvolution(input_dim, output_dim)
+#         self.bn = nn.BatchNorm1d(output_dim)
 
-    def forward(self, x):
+#     def forward(self, input, adj): 
+#         x = self.graph_conv(input_dim, adj)
+#         x = self.bn(x)
 
-        for fc_layer in self.fc_layers:
-            x = fc_layer(x)
-            x = self.relu(x)
+#         return x 
 
-        # Pass through final linear layer 
-        if self.model == 'regression':  
+# class GCN(nn.Module):
 
-            if self.dropout:
-                x = F.dropout(x)
-            x = self.final_layer(x)
-            return x
+#     def __init__(self, input_dim, hidden_dim, n_classes):
 
-        if self.model == 'multilabel':
-            if self.dropout:
-                x = F.dropout(x)
-            x = self.final_layer(x)
-            x = F.log_softmax(x, dim = 1)
+#         super(GCN, self).__init__()
+#         self.gc1 = GraphConvolution(input_dim, hidden_dim)
+#         self.gc2 = GraphConvolution(hidden_dim, n_classes)
 
-            return x
+#     def forward(self, x, adj): 
+#         x = F.relu(self.gc1(x, adj))
+#         x = self.gc2(x, adj)
+#         out = F.log_softmax(x, dim = 1)
+#         return out
 
-        if self.model == 'binary':
-            if self.dropout:
-                x = F.dropout(x)
-            x = self.final_layer(x)
-            x = F.sigmoid(x)
 
-            return x
+# class DeepGCN(nn.Module): 
+
+#     """
+#     Deep Graph Convolutional Neural Network using batch normalization. 
+#     """
+
+#     def __init__(self, dims): 
+
+#         """
+#         Params 
+#         ------
+#         dims (list)
+#             Designed to be supplied in the following format: 
+#             [input_dim, [hidden_dims], output_dim]
+
+#         """
+
+#         super(DeepGCN, self).__init__()
+
+
+#         [input_dim, h_dim, output_dim] = dims
+
+#         neurons = [input_dim, *h_dim]
+
+#         conv_layers = [BnGraphConvLayer(neurons[i-1], neurons[i]) for i in range(1, len(neurons))]
+
+#         self.conv_layers = nn.ModuleList(conv_layers)
+#         self.output_layer = BnGraphConvLayer(neurons[-1], output_dim)
+
+
+#     def forward(self, x, adj): 
+
+#         for GCN_layer in self.conv_layers: 
+#             x = GCN_layer(x, adj)
+#             x = F.relu(x)
+
+#         x = self.output_layer(x, adj)
+#         out = F.log_softmax(x, dim=1)
+
+#         return out
 
 
 
