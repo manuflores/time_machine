@@ -1,9 +1,12 @@
 import gzip 
 import numpy as np 
+from scipy import sparse
 import pandas as pd
 import tqdm 
 import re
-import collections 
+import collections
+import anndata as ad
+import multiprocessing as mp
 
 import torch
 import torch.nn as nn 
@@ -17,14 +20,37 @@ from torch.autograd import Variable
 from torch.utils.data import Dataset, IterableDataset, DataLoader
 
 
-def initialize_network_weights(net, method = 'kaiming'): 
+def try_gpu(i=0):  
+    """
+    Return gpu(i) if exists, otherwise return cpu().
+
+    Extracted from https://github.com/d2l-ai/d2l-en/blob/master/d2l/torch.py
+    """
+    if torch.cuda.device_count() >= i + 1:
+        return torch.device(f'cuda:{i}')
+    return torch.device('cpu')
+
+
+def try_all_gpus():
+    """
+    Return all available GPUs, or [cpu(),] if no GPU exists.
+
+    Extracted from https://github.com/d2l-ai/d2l-en/blob/master/d2l/torch.py
+    """
+    devices = [torch.device(f'cuda:{i}')
+             for i in range(torch.cuda.device_count())]
+    return devices if devices else [torch.device('cpu')]
+
+
+
+def initialize_network_weights(net, method = 'kaiming', seed = 4): 
     """
     Initialize fully connected and convolutional layers' weights
     using the Kaiming (He) or Xavier method. 
     This method is recommended for ReLU / SELU based activations.
     """
 
-    torch.manual_seed(4)
+    torch.manual_seed(seed)
 
     if method == 'kaiming': 
         for module in net.modules():
@@ -394,12 +420,289 @@ class StreamingProteinDataset(IterableDataset):
 
 
 
+class VariationalAutoencoder(nn.Module): 
+
+    def __init__(self, dims, beta = 1, recon_loss = 'BCE'):
+        """
+        Variational autoencoder (VAE) module with single hidden layer. 
+        Contains functions to reconstruct a dataset and 
+        project it into a latent space.
+
+        Params 
+        ------
+        dims (array-like):
+            Dimensions of the networks given by the number of neurons
+            of the form [input_dim, hidden_dim_1, ..., hidden_dim_n, latent_dim], 
+            where `input_dim` is the number of features in the dataset. 
+
+            Note: The encoder and decoder will have a symmetric architecture.
+
+        recon_loss (str, defult = 'BCE')
+            Reconstruction loss. Avaiable loss functions are 
+            binary cross entropy ('BCE') and mean squared error ('MSE'). 
+
+            We have empirically found that using BCE on minmax normalized
+            data gives good results. 
+
+        dims (array-like):
+                Dimensions of the networks given by the number of neurons
+                of the form [input_dim, hidden_dim_1, ..., hidden_dim_n, latent_dim].
+                The encoder and decoder will have a symmetric architecture.
+            
+        """
+        
+        super(VariationalAutoencoder, self).__init__()
+
+        
+        self.input_dim = dims[0]
+        #self.output_dim = dims[0]
+        self.embedding_dim = dims[-1]
+
+        # ENCODER
+
+        # Start range from 1 so that dims[i-1] = dims[0]
+        hidden_layers_encoder = [
+            BnLinear(dims[i-1], dims[i]) for i in range(1, len(dims[:-1]))
+        ] 
+
+        self.encoder_hidden = nn.ModuleList(hidden_layers_encoder)
+
+        # Stochastic layers 
+        self.mu = BnLinear(dims[-2], self.embedding_dim)
+        self.log_var = BnLinear(dims[-2], self.embedding_dim)
+
+
+        # DECODER
+        dims_dec = dims[::-1] # []
+
+        hidden_layers_decoder = [
+            BnLinear(dims_dec[i-1], dims_dec[i]) for i in range(1, len(dims_dec[:-1]))
+        ]
+
+        self.decoder_hidden = nn.ModuleList(hidden_layers_decoder)
+
+        self.reconstruction_layer = BnLinear(dec_dims[-2], self.input_dim)
+
+        # Activation functions 
+        self.sigmoid = nn.Sigmoid()
+        #self.relu = nn.ReLU()
+        #self.tanh= nn.Tanh()
+
+    def encoder(self, x): 
+        """
+        Encode a batch of samples and return posterior parameters 
+        mu and logvar for each point. 
+
+        Attempts to generate probability distribution P(z|x)
+        from the data by fitting a variation distribution Q_φ(z|x).
+        Returns the two parameters of the distributon (µ, log σ²).
+
+        """
+        for fc_layer in self.encoder_hidden: 
+            x = fc_layer(x)
+            x = F.tanh(x)
+
+        mu = self.mu(x)
+        logvar = self.logvar(x)
+
+        return mu, logvar 
+
+    def decoder(self, z): 
+        """
+        Decodes a batch of latent variables.
+
+        Generative network. Generates samples from the original data 
+        distribution P(x) by approximating p_θ(x|z). It uses a Sigmoid activation 
+        for the output layer, so input data must be normalized between 0 and 1
+        (e.g. min-max normalized).
+        """
+        for fc_layer in self.decoder_hidden: 
+            x = fc_layer(x)
+            x = F.tanh(x)
+
+        x = self.reconstruction_layer(x)
+        x = self.sigmoid(x)
+
+        return x
+
+    def reparam(self, mu, logvar):
+        """
+        Reparametrization trick to sample z values. 
+        This is a stochastic procedure, and returns 
+        the mode during evaluation.
+        """
+
+        if self.training:
+
+            std = logvar.mul(0.5).exp_()
+
+            epsilon = Variable(torch.randn(mu.size()), requires_grad = False)
+
+            if mu.is_cuda: 
+                epsilon = epsilon.cuda()
+
+            #z = ϵ * σ + µ 
+
+            z = eps.mul(std).add_(mu)
+
+            return z
+
+        else:
+            return mu
+
+    def forward(self, x):
+        """
+        Forward pass through Encoder-Decoder.
+        """
+        
+        mu, logvar = self.encoder(x.view(-1, self.input_size))
+        z = self.reparam(mu, logvar)
+        x_recon = self.decoder(z)
+
+        return x_recon, mu, logvar
+
+    def loss(self, reconstruction, x, mu, logvar):
+
+        """
+        Variationa loss, i.e. evidence lower bound (ELBO)
+        It uses closed form of KL divergence between two Gaussians. 
+
+        Params 
+        ------
+        x (torch.tensor)
+            Minibatch of input data. 
+
+        mu (torch.tensor)
+            Output of mean of a stochastic gaussian layer.
+            Used to compute KL-divergence. 
+
+        logvar(torch.tensor)
+            Output of log(σ^2) of a stochastic gaussian layer.
+            Used to compute KL-divergence. 
+
+
+        Returns
+        -------
+        variational_loss(torch.tensor)
+            Sum of KL divergence plus reconstruction loss. 
+
+        """
+        
+        if self.recon_loss == 'BCE': 
+
+            reconstruction_loss = torch.nn.functional.binary_cross_entropy(
+                reconstruction, x.view(-1, self.input_size)
+            )
+
+        elif self.recon_loss == 'MSE': 
+
+
+            reconstruction_loss = torch.nn.functional.mse_loss(
+                reconstruction, x.view(-1, self.input_size)
+            )
+
+        else : 
+            print('Loss function provided is not available.')
+
+
+        # Gaussian - Gaussian KL divergence
+        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+
+        #  Normalize by same number of elems as in reconstruction
+        KLD /= x.view(-1, self.input_size).data.shape[0] * self.input_size
+
+        variational_loss = reconstruction_loss + self.beta*KLD
+
+        return variational_loss
+
+    def get_z(self, x):
+        
+        """
+        Encode a batch of data points into their latent representation z. 
+        """
+
+        mu, logvar = self.encoder(x.view(-1, self.input_size))
+
+        z = self.reparam(mu, logvar)
+
+        return z
+
+    def project_data_into_latent_cell(self, data_loader): 
+        """
+        Generator function to project dataset into latent space. 
+        
+        Params 
+        ------
+        data_loader (torch.DataLoader)
+            DataLoader which handles the batches and parallelization. 
+            
+        n_feats (int)
+            Number of dimensions of original dataset.
+        
+        model (nn.Module)
+            Neural network model to be used for inference. 
+            
+        Returns (yields)
+        -------
+        encoded_sample (array-like generator)
+            Generator single encoded sample in a numpy array format. 
+        """
+        
+        cuda = torch.cuda.is_available()
+
+        # Iterate through all of the batches in the DataLoader
+        for batch_x in tqdm.tqdm(data_loader): 
+
+            if cuda: 
+                batch_x = batch_x.cuda()
+            
+            # Reshape to eliminate batch dimension 
+            batch_x = batch_x.view(-1, self.input_dim)
+            
+            # Project into latent space and convert tensor to numpy array
+            if cuda: 
+                batch_x_preds = model.get_z(batch_x.float()).cpu().detach().numpy()
+            else:                 
+                batch_x_preds = model.get_z(batch_x.float()).detach().numpy()
+            
+            # For each sample decoded yield the line reshaped
+            # to only a single array of size (latent_dim)
+            for x in batch_x_preds:
+                encoded_sample = x.reshape(self.embedding_dim)
+                
+                yield encoded_sample
+
+
+    def get_gaussian_samples(self, x, n_samples = 10):
+        """
+        Generates n_samples from the posterior distribution 
+        p(z|x) ~ Normal (µ (x), diag(σ(x))) from a single data point x.
+        This function is designed to be used after training. 
+        """
+        x = x.view(-1, self.input_size)
+
+        mu, log_var = self.encoder(x)
+
+        var = log_var.exp_()
+
+        cov_mat = torch.diag(var.flatten())
+
+        gaussian = td.MultivariateNormal(mu, cov_mat)
+
+        gaussian_samples = gaussian.sample((n_samples,))
+
+        return gaussian_samples
+
+
+
 class VAE(nn.Module):
 
     """
     Variational autoencoder (VAE) module with single hidden layer. 
     Contains functions to reconstruct a dataset and 
-    project it into a latent space. 
+    project it into a latent space.
+
+    Note: Old VAE function, use VariationalAutoencoder now. 
 
     Params 
     ------
@@ -571,8 +874,9 @@ class VAE(nn.Module):
         gaussian_samples = gaussian.sample((n_samples,))
 
         return gaussian_samples
-        #for sample in gaussian_samples:
-        #    yield samples
+
+
+
 
 
 class VAE_(nn.Module):
@@ -1453,42 +1757,45 @@ class BnLinear(nn.Module):
 
         self.linear = nn.Linear(input_dim, output_dim)
         self.bn = nn.BatchNorm1d(output_dim)
-        #self.relu = nn.ReLU()
-        #self.leaky_relu = nn.LeakyReLU()
 
-    def forward(self, input): 
-        x = self.linear(input)
+    def forward(self, x): 
+        x = self.linear(x)
         x = self.bn(x)
-        #x = self.relu(x)
         
         return x
 
-#model(x)
 
 class supervised_model(nn.Module): 
-    """General supervised model. """
+    """
+    Deep multi-layer perceptron (MLP) for classification and regression.
+    It is built with Linear layers that use Batch Normalization
+    and tanh as activation functions. The model type is defined
+    using the `model` argument. 
+    
+    Params
+    ------
+    dims (list): 
+        Dimensions of the MLP. First element is the input dimension, 
+        final element is the output dimension, intermediate numbers
+        are the dimension of the hidden layers.
+
+    model (str, default = 'regression'): 
+        Type of supervised model. Options are 
+        'regression': For MLP regression.
+        'multiclass': For multiclass classification (single categorical variable).
+        'binary': For binary classification.
+        'multilabel': For multilabel classification, i.e when multiple 
+        categorical columns are to be predicted.
+
+        Notes: 'multiclass' uses F.log_softmax as activation 
+        layer. Use nn.NLLLoss() as loss function.
+
+    dropout (bool, default = True)
+
+    """
 
     def __init__(self, dims, model = 'regression', dropout = True):
-        """
-        Multi-layer perceptron for classification and regression.
-        It is built with Linear layers that use Batch Normalization
-        and ReLU as activation functions. The model type is defined 
-        using the `model` argument. 
-
-        dims (list): 
-            Dimensions of the MLP. First element is the input dimension, 
-            final element is the output dimension. 
-
-        model (str, default = 'regression'): 
-            Type of supervised model. Options are 
-            'regression': For classic MLP regression.
-            'multilabel': For multilabel classification.
-            'binary': For binary classification.
-
-            Notes: Multilabel uses F.log_softmax as activation 
-            layer. Use nn.NLLLoss as loss function. 
-
-        """
+        
 
         super(supervised_model, self).__init__()
 
@@ -1503,48 +1810,177 @@ class supervised_model(nn.Module):
 
         self.model = model
         self.dropout=dropout
-        self.relu = nn.Tanh()#nn.ReLU()
+        self.tanh = nn.Tanh()
+        self.relu = nn.ReLU()
+        self.cuda = torch.cuda.is_available()
 
-    def project(self, x): 
-        "Projects data up to second-to-last layer for visualization."
+    def project(self, x):
+        "Projects data up to last hidden layer for visualization."
 
         for fc_layer in self.fc_layers[:-1]:
             x = fc_layer(x)
-            x = self.relu(x)
+            x = self.tanh(x)
 
         x = self.fc_layers[-1](x)
 
         return x
 
+    def project_to_latent_space(self, data_loader, n_feats, latent_dim):
+        """
+        Returns a generator to project dataset into latent space, 
+        i.e. last hidden layer. 
+        
+        Params 
+        ------
+        data_loader (torch.DataLoader)
+            DataLoader which handles the batches and parallelization. 
+            
+        n_feats (int)
+            Number of dimensions of original dataset.
+        
+        latent_dim (int)
+            Number of dimensions of layer to project onto.
+            
+        Returns (yields)
+        -------
+        encoded_sample (array-like generator)
+            Generator of a single encoded data point in a numpy array format. 
+        """
+        
+        # Set no_grad mode to avoid updating computational graph. 
+        #with torch.no_grad()
+
+        cuda = torch.cuda.is_available()
+    
+
+        # Iterate through all of the batches in the DataLoader
+        for batch_x, targets in tqdm.tqdm(data_loader): 
+
+            if cuda: 
+                batch_x, targets = batch_x.cuda(), targets.cuda()
+            
+            # Reshape to eliminate batch dimension 
+            batch_x = batch_x.view(-1, n_feats)
+            
+            # Project into latent space and convert tensor to numpy array
+            if cuda: 
+                batch_x_preds = self.project(batch_x.float()).cpu().detach().numpy()
+            else: 
+                batch_x_preds = self.project(batch_x.float()).detach().numpy()
+            
+            # For each sample decoded yield the line reshaped
+            # to only a single array of size (latent_dim)
+            for x in batch_x_preds:
+                encoded_sample = x.reshape(latent_dim)
+                
+                yield encoded_sample
+
+
     def forward(self, x):
 
         for fc_layer in self.fc_layers:
             x = fc_layer(x)
-            x = self.relu(x)
+            x = self.tanh(x)
 
         # Pass through final linear layer 
         if self.model == 'regression':  
 
             if self.dropout:
-                x = F.dropout(x)
+                x = F.dropout(x, p = 0.3)
             x = self.final_layer(x)
             return x
 
-        if self.model == 'multiclass':
+        elif self.model == 'multiclass':
             if self.dropout:
-                x = F.dropout(x)
+                x = F.dropout(x, p = 0.3)
             x = self.final_layer(x)
             x = F.log_softmax(x, dim = 1)
 
             return x
 
-        if self.model == 'binary':
+        elif self.model == 'binary':
+            if self.dropout:
+                x = F.dropout(x, p = 0.3)
+            x = self.final_layer(x)
+            x = F.sigmoid(x)
+
+            return x
+
+        elif self.model == 'multilabel':
             if self.dropout:
                 x = F.dropout(x)
             x = self.final_layer(x)
             x = F.sigmoid(x)
 
             return x
+
+        else:
+            print(self.model, ' is not a valid model type.')
+
+
+
+class deep_linear_model(supervised_model):
+    def __init__(self, dims, model = 'regression', dropout = True):
+        super(deep_linear_model, self).__init__(dims)
+        
+        self.output_dim = dims[-1]
+
+        # Start range from 1 so that dims[i-1] = dims[0]
+        linear_layers = [BnLinear(dims[i-1], dims[i]) for i in range(1, len(dims[:-1]))]
+
+        self.fc_layers = nn.ModuleList(linear_layers)
+
+        self.final_layer = BnLinear(dims[-2], self.output_dim)
+
+        self.model = model
+        self.dropout=dropout
+        
+    def project(self, x):
+        "Projects data up to last hidden layer for visualization."
+
+        for fc_layer in self.fc_layers[:-1]:
+            x = fc_layer(x)
+            #x = self.tanh(x)
+
+        x = self.fc_layers[-1](x)
+
+        return x
+
+    def forward(self, x): 
+
+        for fc_layer in self.fc_layers:
+            x = fc_layer(x)
+            
+        # Pass through final linear layer 
+        if self.model == 'regression':  
+            if self.dropout:
+                x = F.dropout(x, p = 0.3)
+            x = self.final_layer(x)
+            return x
+
+        elif self.model == 'multiclass':
+            if self.dropout:
+                x = F.dropout(x, p = 0.3)
+            x = self.final_layer(x)
+            x = F.log_softmax(x, dim = 1)
+            return x
+
+        elif self.model == 'binary':
+            if self.dropout:
+                x = F.dropout(x, p = 0.3)
+            x = self.final_layer(x)
+            x = F.sigmoid(x)
+            return x
+
+        elif self.model == 'multilabel':
+            if self.dropout:
+                x = F.dropout(x)
+            x = self.final_layer(x)
+            x = F.sigmoid(x)
+            return x
+
+        else:
+            print(self.model, ' is not a valid model type.')
 
 
 
@@ -1598,105 +2034,6 @@ class mlp_data_df(Dataset):
         return data, target
 
 
-def project_data_into_latent_cell(data_loader, n_feats, model, latent_dim): 
-    """
-    Generator function to project dataset into latent space. 
-    
-    Params 
-    ------
-    data_loader (torch.DataLoader)
-        DataLoader which handles the batches and parallelization. 
-        
-    n_feats (int)
-        Number of dimensions of original dataset.
-    
-    model (nn.Module)
-        Neural network model to be used for inference. 
-        
-    Returns (yields)
-    -------
-    encoded_sample (array-like generator)
-        Generator single encoded sample in a numpy array format. 
-    """
-    
-    # Set no_grad mode to avoid updating computational graph. 
-    #with torch.no_grad()
-
-    # Iterate through all of the batches in the DataLoader
-    for batch_x in tqdm.tqdm(data_loader): 
-        
-        # Reshape to eliminate batch dimension 
-        batch_x = batch_x.view(-1, n_feats)
-        
-        # Project into latent space and convert tensor to numpy array
-        batch_x_preds = model.get_z(batch_x.float()).detach().numpy()
-        
-        # For each sample decoded yield the line reshaped
-        # to only a single array of size (latent_dim)
-        for x in batch_x_preds:
-            encoded_sample = x.reshape(latent_dim)
-            
-            yield encoded_sample
-
-
-def supervised_trainer(n_epochs, train_loader, val_loader, model,
-                     criterion, optimizer, n_classes = 1): 
-    
-    batch_size = train_loader.batch_size
-    print_every = np.floor(train_loader.dataset.__len__() / batch_size / 10) # minibatches
-
-    loss_vector = [] # to store training loss 
-    val_loss_vector = np.empty(shape = n_epochs)
-
-    for epoch in np.arange(n_epochs): 
-        
-        running_loss = 0
-
-        # TRAINING LOOP
-        for ix, (data, y_true) in enumerate(tqdm.tqdm(train_loader)): 
-            
-            input_ = data.view(batch_size, -1).float()
-        
-            train_loss = train_supervised(
-                model,
-                input_, 
-                y_true, 
-                criterion, 
-                optimizer,
-                n_classes = n_classes
-                )
-            
-            running_loss += train_loss.item()
-            
-             # Print loss 
-            if ix % print_every == print_every -1 : 
-                
-                # Print average loss 
-                print('[%d, %5d] loss: %.3f' %
-                      (epoch + 1, ix+1, running_loss / print_every))
-                
-                loss_vector.append(running_loss / print_every)
-                
-                # Reinitialize loss
-                running_loss = 0.0
-        
-        # VALIDATION LOOP
-        with torch.no_grad():
-            validation_loss = []
-            
-            for i, (data, y_true) in enumerate(tqdm.tqdm(val_loader)):
-                input_ = data.view(batch_size, -1).float()
-                val_loss = validation_supervised(model, input_, y_true, criterion)
-                validation_loss.append(val_loss)
-                
-            mean_val_loss = np.mean(validation_loss).round(2)
-            val_loss_vector[epoch] = mean_val_loss
-            
-            print(f'Val. loss : {mean_val_loss}')
-        
-    print('Finished training')
-
-    return loss_vector, validation_loss
 
 class image_data_flatten_popAE(Dataset): 
     
@@ -1815,7 +2152,7 @@ class unsupervised_dataset(Dataset):
 
 
 
-class scanpy_dataset(Dataset): 
+class adata_torch_dataset(Dataset): 
     """
     Base class for a single cell dataset in .h5ad, i.e. AnnData format
     This object enables building models in pytorch.
@@ -1845,9 +2182,11 @@ class scanpy_dataset(Dataset):
         takes the true labels as input in integer form (e.g. 1,2,3),
         not in one-hot encoded version (e.g. [1, 0, 0], [0, 1, 0], [0, 0, 1]).
 
-        When running a multilabel classifier, specify the columns as a list.
+        When running a multilabel classifier (multiple categorical columns,
+        e.g ´cell_type´ and `behavior`), specify the columns as a **list**.
+
         In this case, we will use the nn.BCELoss() using the one-hot encoded 
-        labels. This is more akin to a multi-output classification.
+        labels. This is akin to a multi-output classification.
 
     multilabel (bool, default = False)
         Indicator variable to specify a multilabel classifier dataset. 
@@ -1861,10 +2200,11 @@ class scanpy_dataset(Dataset):
         If running supervised model, the "y" or target label to be predicted.
     """
 
-    def __init__(self, data= None, transform = False, supervised = False,
-                target_col = None, multilabel = False):
+    def __init__(
+        self, data= None, transform = False, supervised = False,
+        target_col = None, multilabel = False)->torch.tensor:
 
-        self.data = data # This is the h5ad / AnnDataset
+        self.data = data # This is the h5ad / AnnData 
 
         self.supervised = supervised 
         self.target_col = target_col
@@ -1882,8 +2222,10 @@ class scanpy_dataset(Dataset):
             enc = OneHotEncoder(sparse = False)
             self.one_hot_encoder = enc
 
+            n_categories = len(self.target_col)
+
             # Extract target data 
-            y_data = self.data.obs[self.target_col].values.astype(str).reshape(-1,1)
+            y_data = self.data.obs[self.target_col].values.astype(str).reshape(-1, n_categories)
 
             # Build one hot encoder
             self.one_hot_encoder.fit(y_data)
@@ -1912,19 +2254,22 @@ class scanpy_dataset(Dataset):
         if self.transform is not False: 
             data_point = self.transform(data_point)
         
-        # Get labels for supervised classification model
+        # Get all columns for multilabel classification codes
         if self.supervised and self.multilabel:
             target = self.multilabel_codes[ix, :]
+            #target = self.transform(target)
             return data_point, target 
 
+        # Get categorical labels for multiclass or binary classification 
+        # or single column for regression (haven't implemented multioutput reg.)
         elif self.supervised:
             target  = self.data.obs.iloc[ix][self.target_col]
+            #target = self.transform(target)
             return data_point, target
 
+        # Fallback to unsupervised case.
         else:
-            pass
-
-        return data_point
+            return data_point
 
     def codes_to_cat_labels(self, one_hot_labels): 
         """
@@ -2814,55 +3159,174 @@ class supervised_dataset_clf(Dataset):
 
 
 
-
-
-# def get_predictions_supervised(model, data_loader, n_feats): 
-
-#     """
-#     Returns an generator over predicted labels for a supervised model.
-
-#     Params 
-#     ------
-#     model (torch.nn.Module)
-#         Trained supevised model.
-
-#     data_loader(torch.dataloader)
-        
-
-#     Returns 
-#     -------
-#     predictions (generator)
-#         Generator over single instance predictions. 
-
-#     """
-
-#     #with torch.no_grad():
-#     for x, y in tqdm.tqdm(data_loader):
-
-#         x = x.view(-1, n_feats)
-
-#         # Make predictions per single data point.
-#         for data_x in x:
-
-#             outputs = model(data_x.float())
-
-#             values, predictions = torch.max(outputs.data, 1)
-
-#             yield predictions
-
-
-def supervised_model_predict(model, data_loader, criterion, n_points = None, n_feats= None,
-                             n_outputs =1, score = True):
+def train_supervised(
+    model,
+    input_tensor,
+    y_true,
+    loss_fn,
+    optimizer,
+    multiclass =False,
+    n_out = 1,
+    ):
     """
-    Analog to model.predict() from sklearn. Returns a prediction vector given a dataloder.
-    It is designed for working with basic supervised models like binary or multilabel classification,
-    and regression.
+    Helper function to make forward and backward pass with minibatch.
+    
+    Params
+    ------
+    n_out (int, default = 1)
+        Dimensionality of output dimension. Leave as 1 for multiclass, 
+        i.e. the output is a probability distribution over classes (e.g. MNIST).
+    """
+    
+    # Zero out grads 
+    model.zero_grad()
+    y_pred = model(input_tensor)
+    
+    #Note that if it's a multiclass classification (i.e. the output is a 
+    # probability distribution over classes) the loss_fn 
+    # nn.NLLLoss(y_pred, y_true) uses as input y_pred.size = (n_batch, n_classes)
+    # and y_true.size = (n_batch), that's why it doesn't get reshaped. 
+
+    if multiclass: 
+        loss = loss_fn(y_pred, y_true)
+
+    else: # Backprop error
+        loss = loss_fn(y_pred, y_true.view(-1, n_out).float())
+    
+    loss.backward()
+    # Update weights 
+    optimizer.step()
+    
+    return loss
+
+def validation_supervised(model, input_tensor, y_true, loss_fn, multiclass =False, n_classes= 1): 
+    "Returns average loss for an input batch of data with a supervised model."
+    y_pred = model(input_tensor.float())
+    if multiclass:
+        loss = loss_fn(y_pred, y_true)
+    else:
+        loss = loss_fn(y_pred, y_true.view(-1, n_classes).float())
+    
+    return loss.mean()
+
+
+def supervised_trainer(
+    n_epochs,
+    train_loader, 
+    val_loader, 
+    model,
+    criterion, 
+    optimizer,
+    multiclass = False, 
+    n_classes = 1,
+    train_prints_per_epoch = 5):
+    """
+    Helper function to train a supervised model for n_epochs. 
+    
+    Params
+    ------
+    n_classes (int, default = 1)
+        Dimensionality of output dimension. Leave as 1 for multiclass, 
+        i.e. the output is a probability distribution over classes (e.g. MNIST).
+    """
+
+    batch_size = train_loader.batch_size
+    print_every = np.floor(train_loader.dataset.__len__() / batch_size / train_prints_per_epoch) # minibatches
+
+    train_loss_vector = [] # to store training loss 
+    val_loss_vector = np.empty(shape = n_epochs)
+
+    cuda = torch.cuda.is_available()
+
+    if cuda: 
+        device = try_gpu()
+        torch.cuda.set_device(device)
+        model = model.to(device)
+
+    for epoch in np.arange(n_epochs): 
+        
+        running_loss = 0
+
+        # TRAINING LOOP
+        for ix, (data, y_true) in enumerate(tqdm.tqdm(train_loader)): 
+            
+            input_tensor = data.view(batch_size, -1).float()
+            
+            if cuda: 
+                input_tensor = input_tensor.cuda(device = device)
+                y_true = y_true.cuda(device = device)
+                
+            train_loss = train_supervised(
+                model,
+                input_tensor, 
+                y_true, 
+                criterion, 
+                optimizer,
+                multiclass=multiclass,
+                n_out =n_classes
+                )
+            
+            running_loss += train_loss.item()
+            
+            # Print loss 
+            if ix % print_every == print_every -1 : 
+                
+                # Print average loss 
+                print('[%d, %5d] loss: %.3f' %
+                      (epoch + 1, ix+1, running_loss / print_every))
+                
+                train_loss_vector.append(running_loss / print_every)
+                
+                # Reinitialize loss
+                running_loss = 0.0
+        
+        # VALIDATION LOOP
+        with torch.no_grad():
+            validation_loss = []
+            
+            for i, (data, y_true) in enumerate(tqdm.tqdm(val_loader)):
+                input_tensor = data.view(batch_size, -1).float()
+
+                if cuda: 
+                    input_tensor = input_tensor.cuda(device = device)
+                    y_true = y_true.cuda(device = device)
+
+                val_loss = validation_supervised(
+                    model, input_tensor, y_true, criterion, multiclass, n_classes
+                    )
+
+                validation_loss.append(val_loss)
+                
+            mean_val_loss = torch.tensor(validation_loss).mean()
+            val_loss_vector[epoch] = mean_val_loss
+            
+            print('Val. loss %.3f'% mean_val_loss)
+        
+    print('Finished training')
+
+    return train_loss_vector, val_loss_vector
+
+
+def supervised_model_predict(
+    model,
+    data_loader,
+    criterion, 
+    n_points = None, 
+    n_feats= None,
+    multiclass=False,
+    n_outputs =1,
+    score = True
+    ):
+    """
+    Analog to model.predict_proba() from sklearn. Returns a prediction vector given a torch dataloder
+    and model. It is designed for working with basic supervised models like binary or multilabel
+    classification, and regression.
 
     Params
     ------
 
     model (torch.nn.model)
-        Trained supervised model 
+        Trained supervised model.
 
     data_loader
 
@@ -2881,7 +3345,7 @@ def supervised_model_predict(model, data_loader, criterion, n_points = None, n_f
     Returns
     -------
     y_pred (np.array)
-        Array with raw predictions from a forward pass from the model. 
+        Array with raw predictions from a forward pass of the model. 
 
     """
     if n_points == None and n_feats == None: 
@@ -2891,6 +3355,9 @@ def supervised_model_predict(model, data_loader, criterion, n_points = None, n_f
             print('Need to supply number of datapoints and features in input data.')
 
     batch_size = data_loader.batch_size
+
+    cuda = torch.cuda.is_available()
+
     # Initialize predictions array 
     y_pred = torch.zeros(n_points, n_outputs)
 
@@ -2900,6 +3367,9 @@ def supervised_model_predict(model, data_loader, criterion, n_points = None, n_f
 
         for ix, (x, y) in tqdm.tqdm(enumerate(data_loader)):
 
+            if cuda: 
+                x, y = x.cuda(), y.cuda()
+
             # Reshape input for feeding to model 
             x = x.view(-1, n_feats)
 
@@ -2908,45 +3378,309 @@ def supervised_model_predict(model, data_loader, criterion, n_points = None, n_f
             y_pred[ix * batch_size : ix * batch_size + batch_size, :] = outputs
 
             if score: 
-                mean_loss = np.round(
-                    criterion(outputs, y.view(-1, n_outputs).float()).mean().detach().numpy(), 2
-                )
+                if multiclass:
+                    if cuda: 
+                        mean_loss = criterion(outputs, y).mean().cpu().detach().numpy()    
+                    else: 
+                        mean_loss = criterion(outputs, y).mean().detach().numpy()
 
+                else:
+                    if cuda:
+                        mean_loss = criterion(outputs, y.view(-1, n_outputs).float()).mean().cpu().detach().numpy()
+                    else: 
+                        mean_loss = criterion(outputs, y.view(-1, n_outputs).float()).mean().detach().numpy()
 
                 cum_sum+= mean_loss
                 moving_average = cum_sum / (ix + 1)
         
         if score: 
-            print("Mean validation loss: ", moving_average)
+            print("Mean validation loss: %.2f"%moving_average)
 
     return y_pred.detach().numpy()
 
 
-def train_supervised(model, input_tensor, y_true, loss_fn, optimizer, n_classes = 1):
-    "Helper function to make forward and backward pass with minibatch."
+def supervised_embeddings_numpy(
+    X=None,
+    y=None,
+    get_predictions = True,
+    regression = False,
+    multiclass = False,
+    batch_size = 16,
+    model_type = 'binary',
+    n_epochs = 5,
+    learning_rate =1e-3,
+    architecture_list = None,
+    seed = 42
+    )->np.ndarray:
+    """
+    Returns an array of embeddings using neural networks.
+
+    The dataset X can be supplied in np.ndarray, pd.DataFrame or ad.AnnData
+    format. The `y`
+
+    # TO-DO: 
+    # 1. Report accuracy on test set, project on all data points or give the option.
+    # Currently only projecting on test set. 
+    # 2. Early stopping. If the validation loss starts increasing, stop the training.
+    # 3. Handle sparsity
+    # 4. Handle stratifying by other variables in train-test split
+    # 5. Handle multilabel and multioutput regression outputs. 
+
+    Params
+    ------
+    X(np.ndarray, sparse.csr_matrix, or pd.DataFrame)
+        Input dataset. It should
+
+    y(array-like)
+        If doing multiclass classification, input should be 1-d array
+        of labels of dtype int. 
     
-    # Zero out grads 
-    model.zero_grad()
-    y_pred = model(input_tensor)
+    model_type(str,defalt = 'binary')
+        Type of supervised model to run. The options are 'binary',
+        'multiclass', 'multilabel', 'regression'.
     
-    # Backprop error
-    loss = loss_fn(y_pred, y_true.view(-1, n_classes).float())
-    loss.backward()
-    # Update weights 
-    optimizer.step()
+
+    Returns
+    -------
+    """
+    # Extract array 
+    if isinstance(X, pd.DataFrame):
+        # Make AnnData
+        adata = ad.AnnData(
+            X = X.values,
+            var = pd.DataFrame(columns = X.columns.values),
+            obs = pd.DataFrame(y, columns =['label'] )
+        )
+
+    # TO-DO: make sparse if it saves up memory
+    # if not sparse.isspmatrix_csr(X):
+    #     X_sparse = sparse.csr_matrix(X)
+
+    # sparsity = (1 - X_sparse.data.shape[0] / (X.shape[0]*X.shape[1]))*100
+
+    # if sparsity >= 50:
+    #     X = X_sparse
+
+    else:
+        # Make AnnData
+        adata = ad.AnnData(
+            X = X, 
+            obs = pd.DataFrame(y, columns =['label'] )
+        )
+
+    # TO-DO :stratify by other variables
+    from sklearn.model_selection import StratifiedShuffleSplit
+
+    # Initialize stratified sampler
+    splitter = StratifiedShuffleSplit(n_splits = 1, test_size = 0.3, random_state = seed)
+
+    ixs = list(splitter.split(adata.X, adata.obs[['label']]))
+
+    train_ix, val_ix = ixs[0][0], ixs[0][1]
+
+    # Use numpy-like indices to split dataset 
+    train_adata = adata[train_ix].copy()
+    test_adata = adata[val_ix].copy()
+
+    # Initialize torch dataset 
+    train_dataset = adata_torch_dataset(
+        train_adata, transform = transforms.ToTensor(), supervised = True, target_col = 'label'
+    )
+
+    test_dataset = adata_torch_dataset(
+        test_adata, transform = transforms.ToTensor(), supervised = True, target_col = 'label'
+    )
+
+    # Get number of cores 
+    n_cores = mp.n_cores
+
+    # Initialize DataLoader for minibatching 
+    train_loader = DataLoader(
+        train_dataset, batch_size = batch_size, drop_last = True, shuffle = False, num_workers =n_cores
+    )
+
+    val_loader = DataLoader(
+        test_dataset, batch_size = batch_size, drop_last = True, shuffle = False, num_workers = n_cores
+    )
+
+    # Only supporting single-output regression.
+    if model_type == 'binary' or model_type == 'regression':
+        n_cats = 1
+    else:
+        n_cats = int(adata.obs.label.unique().shape[0])
+
+    #n_epochs = 5
+
+    # Dimensionality of the layers in the neural network
+    # we use 3 dimensions in the last hidden layer for visualization
+    if architecture_list is None:
+        dims = [adata.n_vars, 512, 128, 3, n_cats]
+    else:
+        dims = architecture_list
+
+    model = supervised_model(dims, model = 'multiclass', dropout = False)
+    model = initialize_network_weights(model, method = 'xavier_normal')
+
+    optimizer = torch.optim.Adam(model.parameters(), lr = learning_rate, weight_decay = 0)
+
+
+    if model_type =='binary' or model_type =='multilabel':
+        criterion = nn.BCELoss()
+
+    elif model_type == 'multiclass':
+        criterion = nn.NLLLoss()
     
-    return loss
+    elif model_type == 'regression':
+        criterion = nn.MSELoss()
+    else: 
+        print('Need to provide a valid supervised model type.')
 
-def validation_supervised(model, input_tensor, y_true, loss_fn, n_classes= 1): 
-    "Returns average loss for an input batch of data with a supervised model."
-    y_pred = model(input_tensor.float())
-    loss = loss_fn(y_pred, y_true.view(-1, n_classes).float())
+    print('Starting training')
+    print('-------------------')
+    train_loss, val_loss = supervised_trainer(
+        n_epochs,
+        train_loader,
+        val_loader,
+        model,
+        criterion,
+        optimizer,
+        multiclass = multiclass,
+        n_classes = n_cats
+    )
+
+    print('Finished training.\n')
     
-    return loss.mean()
+
+    proj_loader= DataLoader(
+        test_dataset, batch_size = batch_size, drop_last = False, shuffle = False, num_workers = n_cores  
+    )
+
+    print('Starting predictions.')
+    print('-------------------')
+    with torch.no_grad():
+        model.eval()
+        y_hat = supervised_model_predict(
+            model,
+            proj_loader,
+            criterion, 
+            multiclass = multiclass,
+            n_outputs = n_cats, 
+            score = True
+        )
+
+    print('Finished predictions. \n')
+
+    print('Starting embeddings.')
+    print('---------------------')
+
+    with torch.no_grad():
+        model.eval()
+        projection_arr = np.array(
+            list(model.project_to_latent_space(proj_loader, dims[0], dims[-2]))
+        )
+
+    print('Finished embeddings.')
+
+    df = pd.DataFrame(
+       projection_arr, columns = ['latent_' + str(i) for i in range(1, dims[-2] + 1)]
+    )
+
+
+    # TO-DO: handle outputs from multilabel classifier. 
+    # Add model predictions to df
+    if multiclass:
+        df['y_pred'] = y_hat.argmax(axis =1)
+    elif multiclass ==False & model_type== 'binary':
+        df['y_hat'] = y_hat
+        df['y_pred'] = np.round(df['y_hat'])
+    else:
+        df['y_hat'] = y_hat
+
+    df_proj = pd.concat([test_adata.obs, df.set_index(test_adata.obs.index)], axis=1)
+
+    return df_proj, train_loss, val_loss, model
+
+def supervised_embeddings_adata(
+    adata, 
+    label_col,
+    train_ratio,
+    return_embeddings_test_only = False,
+    ):
+    #TO-DO
+    return None
 
 
 
+# Resblock from https://github.com/calico/scnym/blob/master/scnym/model.py
+class ResBlock(nn.Module):
+    '''Residual block.
+    References
+    ----------
+    Deep Residual Learning for Image Recognition
+    Kaiming He, Xiangyu Zhang, Shaoqing Ren, Jian Sun
+    arXiv:1512.03385
+    '''
 
+    def __init__(
+        self,
+        n_inputs: int,
+        n_hidden: int,
+    ) -> None:
+        '''Residual block with fully-connected neural network
+        layers.
+        Parameters
+        ----------
+        n_inputs : int
+            number of input dimensions.
+        n_hidden : int
+            number of hidden dimensions in the Residual Block.
+        Returns
+        -------
+        None.
+        '''
+        super(ResBlock, self).__init__()
+
+        self.n_inputs = n_inputs
+        self.n_hidden = n_hidden
+
+        # Build the initial projection layer
+        self.linear00 = nn.Linear(self.n_inputs, self.n_hidden)
+        self.norm00 = nn.BatchNorm1d(num_features=self.n_hidden)
+        self.relu00 = nn.ReLU(inplace=True)
+
+        # Map from the latent space to output space
+        self.linear01 = nn.Linear(self.n_hidden, self.n_hidden)
+        self.norm01 = nn.BatchNorm1d(num_features=self.n_hidden)
+        self.relu01 = nn.ReLU(inplace=True)
+        return
+
+    def forward(self, x: torch.FloatTensor,
+                ) -> torch.FloatTensor:
+        '''Residual block forward pass.
+        Parameters
+        ----------
+        x : torch.FloatTensor
+            [Batch, self.n_inputs]
+        Returns
+        -------
+        o : torch.FloatTensor
+            [Batch, self.n_hidden]
+        '''
+        identity = x
+
+        # Project input to the latent space
+        o = self.norm00(self.linear00(x))
+        o = self.relu00(o)
+
+        # Project from the latent space to output space
+        o = self.norm01(self.linear01(o))
+
+        # Make this a residual connection
+        # by additive identity operation
+        o += identity
+        return self.relu01(o)
+
+            
 # class GraphConvolution(Module): 
     
 #     """
@@ -3042,6 +3776,5 @@ def validation_supervised(model, input_tensor, y_true, loss_fn, n_classes= 1):
 #         out = F.log_softmax(x, dim=1)
 
 #         return out
-
 
 
