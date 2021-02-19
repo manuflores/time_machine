@@ -469,7 +469,7 @@ class VariationalAutoencoder(nn.Module):
 
         # Stochastic layers 
         self.mu = BnLinear(dims[-2], self.embedding_dim)
-        self.log_var = BnLinear(dims[-2], self.embedding_dim)
+        self.logvar = BnLinear(dims[-2], self.embedding_dim)
 
 
         # DECODER
@@ -481,12 +481,21 @@ class VariationalAutoencoder(nn.Module):
 
         self.decoder_hidden = nn.ModuleList(hidden_layers_decoder)
 
-        self.reconstruction_layer = BnLinear(dec_dims[-2], self.input_dim)
+        self.reconstruction_layer = BnLinear(dims_dec[-2], self.input_dim)
 
-        # Activation functions 
+
         self.sigmoid = nn.Sigmoid()
         #self.relu = nn.ReLU()
         #self.tanh= nn.Tanh()
+
+        self.beta = beta
+
+        if recon_loss == 'BCE': 
+
+            self.reconstruction_loss = nn.BCELoss()
+
+        elif recon_loss == 'MSE': 
+            self.reconstruction_loss = nn.MSELoss()
 
     def encoder(self, x): 
         """
@@ -500,7 +509,7 @@ class VariationalAutoencoder(nn.Module):
         """
         for fc_layer in self.encoder_hidden: 
             x = fc_layer(x)
-            x = F.tanh(x)
+            x = torch.tanh(x)
 
         mu = self.mu(x)
         logvar = self.logvar(x)
@@ -517,11 +526,11 @@ class VariationalAutoencoder(nn.Module):
         (e.g. min-max normalized).
         """
         for fc_layer in self.decoder_hidden: 
-            x = fc_layer(x)
-            x = F.tanh(x)
+            z = fc_layer(z)
+            z = torch.tanh(z)
 
-        x = self.reconstruction_layer(x)
-        x = self.sigmoid(x)
+        x = self.reconstruction_layer(z)
+        #x = self.sigmoid(x) 
 
         return x
 
@@ -543,7 +552,7 @@ class VariationalAutoencoder(nn.Module):
 
             #z = ϵ * σ + µ 
 
-            z = eps.mul(std).add_(mu)
+            z = epsilon.mul(std).add_(mu)
 
             return z
 
@@ -555,7 +564,7 @@ class VariationalAutoencoder(nn.Module):
         Forward pass through Encoder-Decoder.
         """
         
-        mu, logvar = self.encoder(x.view(-1, self.input_size))
+        mu, logvar = self.encoder(x.view(-1, self.input_dim))
         z = self.reparam(mu, logvar)
         x_recon = self.decoder(z)
 
@@ -588,30 +597,17 @@ class VariationalAutoencoder(nn.Module):
 
         """
         
-        if self.recon_loss == 'BCE': 
-
-            reconstruction_loss = torch.nn.functional.binary_cross_entropy(
-                reconstruction, x.view(-1, self.input_size)
+        recon_loss = self.reconstruction_loss(
+            reconstruction, x.view(-1, self.input_dim)
             )
-
-        elif self.recon_loss == 'MSE': 
-
-
-            reconstruction_loss = torch.nn.functional.mse_loss(
-                reconstruction, x.view(-1, self.input_size)
-            )
-
-        else : 
-            print('Loss function provided is not available.')
-
 
         # Gaussian - Gaussian KL divergence
         KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
         #  Normalize by same number of elems as in reconstruction
-        KLD /= x.view(-1, self.input_size).data.shape[0] * self.input_size
+        KLD /= x.view(-1, self.input_dim).data.shape[0] * self.input_dim
 
-        variational_loss = reconstruction_loss + self.beta*KLD
+        variational_loss = recon_loss + self.beta*KLD
 
         return variational_loss
 
@@ -621,7 +617,7 @@ class VariationalAutoencoder(nn.Module):
         Encode a batch of data points into their latent representation z. 
         """
 
-        mu, logvar = self.encoder(x.view(-1, self.input_size))
+        mu, logvar = self.encoder(x.view(-1, self.input_dim))
 
         z = self.reparam(mu, logvar)
 
@@ -661,9 +657,9 @@ class VariationalAutoencoder(nn.Module):
             
             # Project into latent space and convert tensor to numpy array
             if cuda: 
-                batch_x_preds = model.get_z(batch_x.float()).cpu().detach().numpy()
+                batch_x_preds = self.get_z(batch_x.float()).cpu().detach().numpy()
             else:                 
-                batch_x_preds = model.get_z(batch_x.float()).detach().numpy()
+                batch_x_preds = self.get_z(batch_x.float()).detach().numpy()
             
             # For each sample decoded yield the line reshaped
             # to only a single array of size (latent_dim)
@@ -692,6 +688,117 @@ class VariationalAutoencoder(nn.Module):
         gaussian_samples = gaussian.sample((n_samples,))
 
         return gaussian_samples
+
+
+def train_vae(model, input_tensor, optimizer)->torch.tensor:
+    """
+    Forward-backward pass of a VAE model. 
+    """
+
+    # Zero-out grads
+    model.zero_grad()
+
+    # Make forward computation 
+    reconstructed, mu, log_var = model(input_tensor)
+
+    loss = model.loss(reconstructed, input_tensor, mu, log_var)
+
+    loss.backward()
+
+    # Update weights 
+    optimizer.step()
+
+    return loss
+
+
+def validate_vae(model, input_tensor, optimizer)->torch.tensor:
+    
+    reconstructed, mu, log_var = model(input_tensor)
+
+    loss = model.loss(reconstructed, input_tensor, mu, log_var)
+
+    return loss.mean()
+
+def vae_trainer(
+    n_epochs, 
+    train_loader, 
+    val_loader,
+    model, 
+    optimizer, 
+    train_prints_per_epoch = 5):
+
+    """
+    Wrapper function to train a VAE model for n_epochs. 
+    """
+
+    batch_size = train_loader.batch_size 
+    print_every = np.floor(
+        train_loader.dataset.__len__() / batch_size / train_prints_per_epoch
+        )
+
+    train_loss_vector = []
+    val_loss_vector = np.empty(shape = n_epochs)
+
+    cuda = torch.cuda.is_available()
+
+    if cuda: 
+        device = try_gpu()
+        torch.cuda.set_device(device)
+        model = model.to(device)
+
+    for epoch in np.arange(n_epochs): 
+
+        running_loss = 0.0
+
+        # TRAINING LOOP
+
+        for ix, data in enumerate(tqdm.tqdm(train_loader)): 
+
+            # Reshape minibatch 
+            input_tensor = data.view(batch_size, -1).float()
+
+            if cuda: 
+                input_tensor = input_tensor.cuda(device = device)
+
+            train_loss = train_vae(model, input_tensor, optimizer, batch_size)
+
+            running_loss +=train_loss.item()
+
+            # Print loss 
+            if ix % print_every == print_every -1 : # ix starts at 0 
+                print('[%d, %5d] VAE loss : %.3f' %
+                    (epoch + 1, ix +1, running_loss / print_every)
+                    )
+
+                train_loss_vector.append(running_loss / print_every)
+
+                # Restart loss
+                running_loss = 0.0
+
+        # VALIDATION LOOP
+
+        for ix, data in enumerate(tqdm.tqdm(val_loader)):
+            validation_loss = []
+
+            # Reshape minibatch 
+            input_tensor = data.view(batch_size, -1).float()
+
+            if cuda: 
+                input_tensor = input_tensor.cuda(device = device)
+
+            val_loss = validate_vae(model, input_tensor, optimizer)
+
+            validation_loss.append(val_loss)
+                
+        mean_val_loss = torch.tensor(validation_loss).mean()
+        val_loss_vector[epoch] = mean_val_loss
+
+        print('Val. loss %.3f'% mean_val_loss)
+
+    print('Finished training.')
+
+    return train_loss_vector, val_loss_vector
+
 
 
 
@@ -2153,56 +2260,56 @@ class unsupervised_dataset(Dataset):
 
 
 class adata_torch_dataset(Dataset): 
-    """
-    Base class for a single cell dataset in .h5ad, i.e. AnnData format
-    This object enables building models in pytorch.
-    It currently supports unsupervised (matrix factorization / autoencoder)
-    and general supervised (classification/regression) models.
-
-    Params
-    ------
-    data (ad.AnnData)
-        AnnDataset containing the count matrix in the data.X object. 
-
-    transform (torchvision.transforms, default= False)
-        A torchvision.transforms-type transformation, e.g. ToTensor()
-
-    supervised (bool, default = False)
-        Indicator variable for supervised models. 
-
-    target_col (string/array-like, default = None)
-        If running a supervised model, target_col should be a column 
-        or set of columns in the adata.obs dataframe. 
-        When running a binary or multiclass classifier, the labels 
-        should be in a single column in a int64 format. 
-        I repeat, even if running a multiclass classifier, do not specify
-        the columns as one-hot encoded. The one-hot encoded vector 
-        will be specified in the classifier model. The reason is that, 
-        nn.CrossEntropyLoss() and the more numerically stable nn.NLLLoss()
-        takes the true labels as input in integer form (e.g. 1,2,3),
-        not in one-hot encoded version (e.g. [1, 0, 0], [0, 1, 0], [0, 0, 1]).
-
-        When running a multilabel classifier (multiple categorical columns,
-        e.g ´cell_type´ and `behavior`), specify the columns as a **list**.
-
-        In this case, we will use the nn.BCELoss() using the one-hot encoded 
-        labels. This is akin to a multi-output classification.
-
-    multilabel (bool, default = False)
-        Indicator variable to specify a multilabel classifier dataset. 
-
-    Returns
-    -------
-    data_point(torch.tensor)
-        A single datapoint (row) of the dataset in torch.tensor format. 
-
-    target(torch.tensor)
-        If running supervised model, the "y" or target label to be predicted.
-    """
-
+    "Convert an adata to a torch.Dataset"
     def __init__(
         self, data= None, transform = False, supervised = False,
         target_col = None, multilabel = False)->torch.tensor:
+        """
+        Base class for a single cell dataset in .h5ad, i.e. AnnData format
+        This object enables building models in pytorch.
+        It currently supports unsupervised (matrix factorization / autoencoder)
+        and general supervised (classification/regression) models.
+
+        Params
+        ------
+        data (ad.AnnData)
+            AnnDataset containing the count matrix in the data.X object. 
+
+        transform (torchvision.transforms, default= False)
+            A torchvision.transforms-type transformation, e.g. ToTensor()
+
+        supervised (bool, default = False)
+            Indicator variable for supervised models. 
+
+        target_col (string/array-like, default = None)
+            If running a supervised model, target_col should be a column 
+            or set of columns in the adata.obs dataframe. 
+            When running a binary or multiclass classifier, the labels 
+            should be in a single column in a int64 format. 
+            I repeat, even if running a multiclass classifier, do not specify
+            the columns as one-hot encoded. The one-hot encoded vector 
+            will be specified in the classifier model. The reason is that, 
+            nn.CrossEntropyLoss() and the more numerically stable nn.NLLLoss()
+            takes the true labels as input in integer form (e.g. 1,2,3),
+            not in one-hot encoded version (e.g. [1, 0, 0], [0, 1, 0], [0, 0, 1]).
+
+            When running a multilabel classifier (multiple categorical columns,
+            e.g ´cell_type´ and `behavior`), specify the columns as a **list**.
+
+            In this case, we will use the nn.BCELoss() using the one-hot encoded 
+            labels. This is akin to a multi-output classification.
+
+        multilabel (bool, default = False)
+            Indicator variable to specify a multilabel classifier dataset. 
+
+        Returns
+        -------
+        data_point(torch.tensor)
+            A single datapoint (row) of the dataset in torch.tensor format. 
+
+        target(torch.tensor)
+            If running supervised model, the "y" or target label to be predicted.
+        """
 
         self.data = data # This is the h5ad / AnnData 
 
